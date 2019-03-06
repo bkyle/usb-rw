@@ -1,0 +1,163 @@
+#!/usr/bin/env python
+
+# usb-rw - remount USB drives as read-write.
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from xml.dom import minidom
+from xml.dom.minidom import Document
+
+_verbose = False
+
+def _debug(message: str, device: str = None):
+  if _verbose:
+    if device:
+      print("%s: %s" % (_device(device), message))
+    else:
+      print(message)
+
+def _device(device: str) -> str:
+  """Given an absolute path to a device or a device name, return the name.
+
+  >>> _dev("/dev/disk1")
+  'disk1'
+
+  >>> _dev("disk1")
+  'disk1'
+  """
+  if os.path.isabs(device):
+    return os.path.basename(device)
+  else:
+    return device
+
+class Disk(object):
+
+  def __init__(self, disk: str):
+    self.disk = None
+    self.device = None
+    self.external = False
+    self.protocol = None
+    self.mounted = False
+    self.read_only = False
+
+    _debug("running diskutil info", disk)
+    info = subprocess.check_output(["diskutil", "info", disk], universal_newlines=True)
+
+    m = re.search(r"^\s*Device Identifier:\s*(.*?)$", info, re.MULTILINE)
+    if m:
+      self.disk = m.group(1)
+    m = re.search(r"^\s*Device Node:\s*(.*?)$", info, re.MULTILINE)
+    if m:
+      self.device = m.group(1)
+    m = re.search(r"^\s*Device Location:\s*External$", info, re.MULTILINE)
+    if m:
+      self.external = True
+    m = re.search(r"^\s*Protocol:\s*(.*?)$", info, re.MULTILINE)
+    if m:
+      self.protocol = m.group(1)
+    m = re.search(r"^\s*Mounted:\s*Yes$", info, re.MULTILINE)
+    if m:
+      self.mounted = True
+    m = re.search(r"\s*Read-Only Volume:\s*Yes$", info, re.MULTILINE)
+    if m:
+      self.read_only = True
+
+  def __repr__(self):
+    return "Disk(disk=%s, device=%s, external=%s, protocol=%s, mounted=%s, read_only=%s)" % \
+      (self.disk, self.device, self.external, self.protocol, self.mounted, self.read_only)
+
+  def fix_mount(self):
+    _debug("running mount -u", self.device)
+    return subprocess.call(["mount", "-u", disk.device]) == 0
+
+def find_disks(monitor: bool = True):
+  if monitor:
+    _debug("find_disks: running diskutil activity")
+    proc = subprocess.Popen(
+      ["diskutil", "activity"],
+      stdout=subprocess.PIPE,
+      bufsize=-1,
+      universal_newlines=True,
+    )
+    pattern = re.compile(r"\*\*\*DiskAppeared \('([^']*)'")
+    for line in proc.stdout:
+      line = line.strip()
+      m = pattern.match(line)
+      if m:
+        yield Disk(m.group(1))
+  else:
+    _debug("find_disks: running diskutil list -plist")
+    plist = subprocess.check_output(["diskutil", "list", "-plist"])
+
+    _debug("find_disks: parsing output")
+    document = minidom.parseString(plist)
+    document.normalize()
+    for e in document.getElementsByTagName('key'):
+      # Find the <key>AllDisks</key> element
+      if not (e.hasChildNodes() and e.nodeType == Document.ELEMENT_NODE and e.firstChild.nodeValue == 'AllDisks'):
+        continue
+
+      _debug("find_disks: found disks")
+      # Find the next sibling <array> element, there could be comment nodes, text nodes, etc.
+      # between the <key> and the <array>
+      e = e.nextSibling
+      while e is not None:
+        if e.nodeType == Document.ELEMENT_NODE and e.tagName == "array":
+          break
+        e = e.nextSibling
+      else:
+        continue
+
+      # Read all of the text nodes from the children
+      e = e.firstChild
+      while e is not None:
+        if (e.nodeType == Document.ELEMENT_NODE and e.tagName == "string" and \
+          e.hasChildNodes() and e.firstChild.nodeType == Document.TEXT_NODE):
+          yield Disk(e.firstChild.nodeValue)
+        e = e.nextSibling
+
+
+parser = argparse.ArgumentParser(prog="usb-rw", description="Mounts USB drives as read-write")
+parser.add_argument("-w", "--wait", dest="wait", default=False, action="store_true", help="Wait for a drive to be present")
+parser.add_argument("-v", "--verbose", dest="verbose", default=False, action="store_true", help="Be more verbose")
+parser.add_argument("-m", "--monitor", dest="monitor", default=False, action="store_true", help="Monitor drives as they are added and removed")
+parser.add_argument("disk", nargs="*", help="disk or device to be remounted")
+
+args = parser.parse_args()
+
+if os.geteuid() != 0:
+  print("This command must be run as root.")
+  sys.exit(1)
+
+_verbose = args.verbose
+
+# By default we only want one pass through the disks but if --wait was specified then at
+# least one disk needs to be procesed.  To handle this case exit_when_done acts indicates
+# whether the program should exit when a pass through the disks is complete.
+exit_when_done = True
+if args.wait:
+  exit_when_done = False
+
+while True:
+
+  disks = None
+  if args.disk:
+    disks = [Disk(d) for d in args.disk]
+  else:
+    disks = find_disks(monitor=args.monitor)
+
+  for disk in disks:
+    if disk.read_only and disk.external and disk.protocol == "USB":
+      exit_when_done = True
+      if disk.fix_mount():
+        print("mounted as (rw)", disk.device)
+      else:
+        print("mounted as (ro)", disk.device)
+    else:
+      _debug("skipping", disk.device)
+
+  if exit_when_done:
+    break
